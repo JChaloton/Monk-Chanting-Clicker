@@ -1,0 +1,23 @@
+# build output
+*.o
+*.elf
+*.bin
+*.hex
+*.lst
+*.map
+*.d
+
+# ch32v003fun checkout, if vendored rather than submoduled
+/ch32v003fun/
+
+# audio working files — recordings and blobs stay out of git
+*.wav
+*.mp3
+*.raw
+chant.bin
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
+__pycache__/
