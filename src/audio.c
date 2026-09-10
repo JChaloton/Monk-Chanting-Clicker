@@ -3,14 +3,19 @@
  *
  * Two things here are worth understanding before changing anything.
  *
- * 1. The sample clock is SysTick, not TIM1. This settles the open question in
- *    docs/decisions.md. The carrier is 187.5 kHz and 187500 / 8000 = 23.4375, so
- *    no whole-number division of the TIM1 update event lands on 8 kHz. Dividing
- *    the core clock instead lands exactly: 48 000 000 / 8000 = 6000. SysTick is
- *    32-bit with hardware auto-reload, is otherwise unused, and its ISR is a
- *    load and a store. Carrier stays at exactly 187.5 kHz, sample rate at
- *    exactly the header's rate, and the only pitch error left is the
- *    oscillator's. Proved first on src/demo/led_wave_demo.c.
+ * 1. The sample clock is TIM2, not TIM1 and not SysTick. The carrier is
+ *    187.5 kHz and 187500 / 8000 = 23.4375, so no whole-number division of the
+ *    TIM1 update event lands on 8 kHz. A second timer off the same 48 MHz APB
+ *    clock lands exactly: 48 000 000 / 8000 = 6000, so ATRLR = 5999.
+ *
+ *    It was SysTick first, for the same exact division, and that was a bug:
+ *    ch32fun builds Delay_Us()/Delay_Ms() on the free-running SysTick counter
+ *    (DelaySysTick() spins on SysTick->CNT). Reprogramming SysTick for the
+ *    sample rate breaks every delay in the firmware, and stopping it with
+ *    CTLR = 0 freezes CNT so the next Delay_*() never returns — the board hung
+ *    inside audio_stop()'s ramp with the amp still enabled, which sounds
+ *    exactly like "one press and then hiss forever". TIM2 is otherwise unused
+ *    and leaves ch32fun's timebase alone.
  *
  * 2. The ISR never touches SPI. It reads out of whichever buffer is active and
  *    hands the spent one to the main loop. A 256-byte page is 32 ms of audio and
@@ -34,6 +39,7 @@ static volatile uint8_t  play_idx;               /* buffer the ISR is reading  *
 static volatile uint16_t play_pos;               /* byte offset inside it      */
 static volatile int8_t   refill_idx;             /* -1 = nothing to refill     */
 static volatile uint8_t  running;
+static volatile uint32_t played;                 /* samples out since start    */
 
 /* Main-loop only. */
 static uint32_t src_addr;
@@ -88,31 +94,36 @@ static void ramp_to(uint16_t target)
 
 static void tick_start(uint32_t rate)
 {
-    SysTick->CTLR = 0;
-    SysTick->CNT  = 0;
-    SysTick->CMP  = (FUNCONF_SYSTEM_CORE_CLOCK / rate) - 1u;
-    SysTick->SR   = 0;
-    /* STE | STIE | STCLK (count HCLK, not HCLK/8) | STRE (auto-reload). */
-    SysTick->CTLR = 0x0f;
-    /* Note the capital K — that is how the WCH header spells this enumerator.
-     * If your ch32v003fun checkout spells it SysTick_IRQn, change it here. */
-    NVIC_EnableIRQ(SysTick_IRQn);
+    RCC->APB1PCENR |= RCC_APB1Periph_TIM2;
+
+    TIM2->CTLR1    = 0;                     /* stopped while we reconfigure   */
+    TIM2->PSC      = 0;                     /* no prescale: full 48 MHz       */
+    TIM2->ATRLR    = (uint16_t)((FUNCONF_SYSTEM_CORE_CLOCK / rate) - 1u);
+    TIM2->CNT      = 0;
+    TIM2->SWEVGR   = TIM_UG;                /* latch PSC/ATRLR now            */
+    TIM2->INTFR    = 0;                     /* ...and drop the flag UG just set,
+                                             * or the ISR fires immediately   */
+    TIM2->DMAINTENR = TIM_UIE;
+    NVIC_EnableIRQ(TIM2_IRQn);
+    TIM2->CTLR1    = TIM_ARPE | TIM_CEN;
 }
 
 static void tick_stop(void)
 {
-    SysTick->CTLR = 0;
-    SysTick->SR   = 0;
+    TIM2->CTLR1    = 0;
+    TIM2->DMAINTENR = 0;
+    TIM2->INTFR    = 0;
+    NVIC_DisableIRQ(TIM2_IRQn);
 }
 
 /*
  * Sample ISR. Short on purpose: one bounds check, one store to the compare
  * register, and the buffer swap. No SPI, no arithmetic, no printf.
  */
-void SysTick_Handler(void) __attribute__((interrupt));
-void SysTick_Handler(void)
+void TIM2_IRQHandler(void) __attribute__((interrupt));
+void TIM2_IRQHandler(void)
 {
-    SysTick->SR = 0;               /* clear first, or it immediately re-fires */
+    TIM2->INTFR = 0;               /* clear first, or it immediately re-fires */
 
     if (!running)
         return;
@@ -143,6 +154,7 @@ void SysTick_Handler(void)
     }
 
     TIM1->CH1CVR = buf[i][play_pos++];
+    played++;
 }
 
 /* ---- api ----------------------------------------------------------------- */
@@ -178,6 +190,7 @@ void audio_start(uint32_t flash_addr, uint32_t len, uint8_t format, uint32_t rat
         return;
 
     running       = 0;
+    played        = 0;
     play_idx      = 0;
     play_pos      = 0;
     refill_idx    = -1;
@@ -216,4 +229,30 @@ void audio_stop(void)
     running = 0;
     tick_stop();
     ramp_to(AUDIO_IDLE_DUTY);
+}
+
+/* ---- bring-up diagnostics ------------------------------------------------ */
+
+uint32_t audio_played(void)
+{
+    return played;
+}
+
+/*
+ * No flash, no interrupt, no buffers — just TIM1 and a delay loop. The swing is
+ * +/-64 counts either side of mid-scale rather than the full 0..255, because the
+ * point is to prove the chain works, not to test how loud it gets.
+ */
+void audio_test_tone(uint32_t hz, uint32_t ms)
+{
+    uint32_t half_us = 500000u / hz;
+    uint32_t cycles  = (ms * 1000u) / (half_us * 2u);
+
+    for (uint32_t i = 0; i < cycles; i++) {
+        TIM1->CH1CVR = AUDIO_IDLE_DUTY + 64u;
+        Delay_Us(half_us);
+        TIM1->CH1CVR = AUDIO_IDLE_DUTY - 64u;
+        Delay_Us(half_us);
+    }
+    TIM1->CH1CVR = AUDIO_IDLE_DUTY;
 }

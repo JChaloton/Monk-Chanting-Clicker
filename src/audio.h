@@ -33,4 +33,19 @@ void audio_service(void);
 /* Ramp duty back to AUDIO_IDLE_DUTY and stop the sample clock (anti-pop). */
 void audio_stop(void);
 
+/* ---- bring-up diagnostics ------------------------------------------------ */
+
+/* Samples handed to the PWM since the last audio_start(). Zero after a play
+ * means the sample interrupt never fired; short of the chant's length means it
+ * underran. Costs one increment in the ISR. */
+uint32_t audio_played(void);
+
+/* Square wave straight out of TIM1, no flash and no interrupt involved: a
+ * busy-wait loop toggling the duty either side of AUDIO_IDLE_DUTY. Call it
+ * with the amp already enabled. This is the halving test for "no sound" — if
+ * the tone is audible the PWM, filter, amp and speaker are all fine and the
+ * fault is upstream in the samples or the sample clock; if it is silent the
+ * fault is in that analog chain and no amount of firmware will help. */
+void audio_test_tone(uint32_t hz, uint32_t ms);
+
 #endif /* AUDIO_H */

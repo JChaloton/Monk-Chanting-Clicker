@@ -17,7 +17,7 @@
 
 | Decision | Reasoning |
 |---|---|
-| **Sample tick is SysTick**, not a TIM1 update divisor | 48 000 000 / 8000 = 6000 exactly, so the carrier stays at exactly 187.5 kHz and the sample rate at exactly the header's rate. 187500 / 8000 = 23.4375 has no whole-number answer. Proved on the LED demo, adopted in `src/audio.c`. |
+| **Sample tick is TIM2**, not a TIM1 update divisor and no longer SysTick | 48 000 000 / 8000 = 6000 exactly (ATRLR = 5999), so the carrier stays at exactly 187.5 kHz and the sample rate at exactly the header's rate. 187500 / 8000 = 23.4375 has no whole-number answer. **Reversed from SysTick after first hardware bring-up:** ch32fun builds `Delay_Us()`/`Delay_Ms()` on the free-running SysTick counter, so reprogramming SysTick for the sample rate broke every delay in the firmware, and stopping it with `CTLR = 0` froze `SysTick->CNT` so the next delay never returned. The board hung inside `audio_stop()`'s anti-pop ramp with the amp still enabled: one press, then hiss forever. TIM2 divides the same 48 MHz clock just as exactly and leaves ch32fun's timebase alone. `src/demo/led_wave_demo.c` still uses SysTick and is fine — it calls no delays. |
 | **Press during playback is ignored** | `play_chant()` blocks. A chant that restarts halfway through is worse than one that finishes. Change it by polling PD3 inside the service loop if the monk disagrees. |
 | **Sample rate comes from the flash header**, not a compile-time constant | Re-recording at a different rate needs no firmware change. `board.h`'s 8000 is only the default the host tool writes. |
 | **Loader verifies with a CRC32 computed on the MCU** | Reading 1 MB back over the UART costs as long again as writing it. Four bytes instead, same polynomial as `zlib.crc32`. |
