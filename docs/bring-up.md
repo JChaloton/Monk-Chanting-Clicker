@@ -23,12 +23,33 @@ Those two numbers are the whole analog front end verified.
 
 **5 — Add U3.** Four SPI lines, WP# and HOLD# to the rail, C8 at pin 8. Send the JEDEC
 ID command (`9Fh`) and print the reply: **`A1 40 14`**. Those three exact bytes prove
-all four SPI wires in both directions in one shot. Then write a page, read it back,
-compare.
+all four SPI wires in both directions in one shot.
+
+Easiest way to see it: flash the player (`make flash`) and run `make monitor`. It
+prints the ID at boot before anything else happens. `000000` means MISO (PC7) or the
+chip's 3 V is wrong; `ffffff` means CS# (PC4) never gets pulled low. Do not debug
+anything else until this one number is right.
+
+**5b — Load the chant.** Only once stage 5 passes:
+
+```sh
+make -f Makefile.loader flash                  # loader instead of the player
+python tools/send_chant.py COM7 chant.raw      # ~2 min, ends with a CRC match
+make flash                                     # player back
+```
+
+Wiring for the middle step and the wire protocol: `../src/loader/README.md`. The
+loader also prints the JEDEC ID on request, so it is a second opinion on stage 5 if
+you want one. This stage writes a page, erases sectors, and reads the whole chip back
+as a CRC — it is the "write a page, read it back, compare" test, at full scale.
 
 **6 — Add U2 + speaker.** With PC3 LOW: **silence** — this is the PAM8302A pinout
-sanity check. Drive PC3 HIGH and play a 440 Hz PWM tone: a clean beep. Then load the
-chant into U3 and play it for real.
+sanity check. Drive PC3 HIGH and play a 440 Hz PWM tone: a clean beep. Then, with the
+chant already in U3 from stage 5b, `make flash` and press the switch: the player reads
+the header, wakes the flash, unmutes the amp, and streams the chant.
+
+`make monitor` shows what the player thinks it has — format, rate, length, seconds. If
+it says *no valid CHNT header*, stage 5b did not take.
 
 **7 — Power discipline.** Add standby/wake and the flash power-down sequencing, then
 measure idle current (µA range, in series with the battery). Target ~9 µA.

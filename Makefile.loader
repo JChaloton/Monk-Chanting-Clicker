@@ -1,0 +1,33 @@
+# Makefile.loader — the one-off UART -> SPI-flash loader firmware.
+#
+#   make -f Makefile.loader flash     write the loader to the MCU
+#   python tools/send_chant.py COM7 chant.raw
+#   make flash                        put the player back
+#
+# Its own makefile for the same reason as Makefile.leddemo: the loader shares
+# board.h and spiflash.c with the product but is not part of it, and it must be
+# obvious which firmware is currently on the chip.
+#
+# It compiles src/loader/loader.c and src/spiflash.c only — no audio.c, no
+# main.c, so it cannot make a sound while it works.
+
+TARGET      := src/loader/loader
+CH32V003FUN ?= ch32v003fun/ch32fun
+MINICHLINK  ?= ch32v003fun/minichlink
+
+TARGET_MCU  := CH32V003
+
+ADDITIONAL_C_FILES := src/spiflash.c
+
+# Set before the include: ch32v003fun.mk appends to CFLAGS, so this survives.
+CFLAGS += -Isrc
+
+include $(CH32V003FUN)/ch32fun.mk
+
+.PHONY: flash clean-all
+
+flash: $(TARGET).bin
+	$(MINICHLINK)/minichlink -w $< flash -b
+
+clean-all: clean
+	rm -f $(TARGET).bin $(TARGET).elf $(TARGET).map

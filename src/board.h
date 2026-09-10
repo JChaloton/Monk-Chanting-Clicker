@@ -31,6 +31,24 @@
 #define PIN_FLASH_MOSI_NUM  6       /* PC6 -> U3 pin 5 DI   */
 #define PIN_FLASH_MISO_NUM  7       /* PC7 <- U3 pin 2 DO   */
 
+/* SPI bit clock = 48 MHz / (2 << FLASH_SPI_BR).  3 -> /16 -> 3 MHz.
+ * Streaming 8 kB/s needs nothing like this; the margin is for hand-wired
+ * perfboard, where long unshielded SCK/DO runs are the thing that breaks.
+ * If the JEDEC ID reads back wrong, raise this number (slower) before
+ * suspecting the solder joints. */
+#define FLASH_SPI_BR        3u
+
+/* UART — debug printf and the one-off audio loader (src/loader/). Fixed by the
+ * USART1 peripheral at its default (non-remapped) pins. */
+#define PIN_UART_PORT       GPIOD
+#define PIN_UART_TX_NUM     5       /* PD5, U1 pin 2 -> adapter RX */
+#define PIN_UART_RX_NUM     6       /* PD6, U1 pin 3 <- adapter TX */
+#define LOADER_BAUD         57600u  /* HSI is ~1 % accurate; do not get greedy.
+                                     * Halved from 115200: on hand-wiring the
+                                     * faster rate corrupted bytes often enough
+                                     * that the resync machinery could not keep
+                                     * up. 450 KB still loads in ~80 s. */
+
 /* PD1 is SWIO (programming). Never reconfigure it as GPIO — you can lock the
  * WCH-LinkE out and need the power-cycle unlock. PD5/PD6 are UART TX/RX, free
  * for debug printf and for the audio loader in src/loader/. */

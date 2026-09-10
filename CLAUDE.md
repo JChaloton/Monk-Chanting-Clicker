@@ -39,13 +39,13 @@ Pin map (this is the contract between `board.h` and the schematic):
 | 18 PD1 | SWIO | J1 programming header (WCH-LinkE) — keep dedicated |
 | 19 PD2 | audio PWM, TIM1 CH1 | R1 → C1 low-pass → R2/R3 divider → C2 → U2 IN+ |
 | 20 PD3 | switch input, active-LOW, internal pull-up, EXTI wake | SW1 → GND |
-| 13 PC3 | amp enable, HIGH = play | U2 pin 4 SD (+ R4 100k pull-down) |
-| 14 PC4 | SPI CS# | U3 pin 1 |
+| 13 PC3 | amp enable, HIGH = play | U2 pin 4 SD (+ R5 100k pull-down) |
+| 14 PC4 | SPI CS# | U3 pin 1 (+ R6 10k pull-up) |
 | 15 PC5 | SPI SCK | U3 pin 6 CLK |
 | 16 PC6 | SPI MOSI | U3 pin 5 DI |
 | 17 PC7 | SPI MISO | U3 pin 2 DO |
-| 4 PD7 | NRST | optional 10k pull-up (R5) |
-| 2 PD5 / 3 PD6 | UART TX/RX | free — debug printf, and the audio loader |
+| 4 PD7 | NRST | 10k pull-up (R4) |
+| 2 PD5 / 3 PD6 | UART TX/RX | debug printf, and the audio loader |
 
 ## Firmware facts that constrain the code
 
@@ -59,17 +59,31 @@ Pin map (this is the contract between `board.h` and the schematic):
   wake `ABh`) whenever not playing; MCU in standby ≈ 9 µA. Skipping the flash
   power-down alone blows the whole sleep budget.
 - **Debounce ~20 ms** on PD3. Ramp PWM duty at start and stop to avoid pops.
-- Toolchain: **ch32v003fun** (preferred) or MounRiver Studio. Programmer: WCH-LinkE.
+- Toolchain: **ch32v003fun**, driven either by the Makefiles or by PlatformIO
+  (`platformio.ini`, community `platform-ch32v`). Programmer: WCH-LinkE.
 
 ## Repo layout
 
 ```
 CLAUDE.md          this file
 docs/              hardware, firmware plan, audio pipeline, bring-up, decisions
-src/               player firmware (stubs — to be written)
-src/loader/        one-off UART→flash loader firmware (stub)
-tools/             host-side audio conversion (wav → 8 kHz mono blob)
+src/               player firmware — main.c, audio.c, spiflash.c
+src/loader/        one-off UART→flash loader firmware (loader.c)
+src/demo/          LED demo: the timing core on a bare dev board
+tools/             send_chant.py (host → flash), wav2raw.py (stub), wav2led.py
+scripts/           PlatformIO extra scripts
+Makefile           the player      -> make flash
+Makefile.loader    the loader      -> make -f Makefile.loader flash
+Makefile.leddemo   the LED demo
+platformio.ini     the same three firmwares as PlatformIO environments
 ```
+
+**Two build systems, one set of sources.** The Makefiles are the reference;
+`platformio.ini` builds the identical files out of `src/`. PlatformIO compiles
+everything under `src/` by default and this tree holds three `main()`s, so each
+environment carries an explicit `build_src_filter`. **Adding a .c file means editing
+both** the matching Makefile's `ADDITIONAL_C_FILES` and that environment's filter —
+otherwise one build system silently links a different program than the other.
 
 ## Working rules
 
@@ -91,8 +105,19 @@ tools/             host-side audio conversion (wav → 8 kHz mono blob)
 
 ## Status
 
-Design is settled on paper; nothing has been built or written yet. Next physical step
-is breadboard bring-up per `docs/bring-up.md` (needs a WCH-LinkE). Next code step is
-`src/` step 1: blink PD2 under WCH-LinkE control.
+Hardware is built: everything is soldered onto perfboard around a CH32V003 dev board.
+
+Firmware written and syntax-checked, **not yet run on hardware**:
+- `src/spiflash.c` — full FM25Q08B driver
+- `src/loader/loader.c` + `tools/send_chant.py` — UART → flash audio loader
+- `src/audio.c`, `src/main.c` — the player
+
+The load path was verified end to end against a Python model of the loader, so the
+framing, checksums, padding and CRC agree on both sides. Nothing has touched a real
+chip yet — work through `docs/bring-up.md` stages 4–6 in order.
+
+Not implemented, on purpose: **step 7, MCU standby with EXTI wake.** The amp and the
+flash are already powered down between plays; what is left is the MCU's poll loop, a
+few mA. Fine on the bench, wrong for a keychain. See the header comment in `src/main.c`.
 
 Open items are tracked in `docs/decisions.md`.

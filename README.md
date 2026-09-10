@@ -9,10 +9,12 @@ circuit design, and firmware.
 
 ## Status
 
-Design settled on paper. Nothing built, no firmware written. `src/` is a skeleton.
+Built on perfboard around a CH32V003 dev board. Player firmware, the UART audio
+loader, and the host uploader are written; none of it has run on the hardware yet.
+Work through `docs/bring-up.md` stages 4–6 in order.
 
-Next hardware step: breadboard bring-up, `docs/bring-up.md` (needs a WCH-LinkE).
-Next firmware step: toggle PD2 under the programmer — stage 2.
+MCU standby (stage 7) is deliberately not implemented yet — the amp and flash already
+power down between plays, but the MCU still polls, so bench idle current is mA, not µA.
 
 ## Docs
 
@@ -24,6 +26,8 @@ Next firmware step: toggle PD2 under the programmer — stage 2.
 | [`docs/audio-pipeline.md`](docs/audio-pipeline.md) | chant → 8 kHz blob → flash |
 | [`docs/bring-up.md`](docs/bring-up.md) | staged assembly + pre-power checklist |
 | [`docs/decisions.md`](docs/decisions.md) | what was decided and why, and what is still open |
+| [`docs/led-demo.md`](docs/led-demo.md) | run the player on a bare dev board, output to an LED |
+| [`src/loader/README.md`](src/loader/README.md) | the UART→flash loader and its wire protocol |
 
 Illustrated schematic walkthrough (block diagram + full drawn schematic):
 https://claude.ai/code/artifact/a1a5eccc-82fa-48f8-8542-af769fb2e9c6
@@ -33,18 +37,62 @@ PAM8302A, FM25Q08B.
 
 ## Build
 
+Two ways, same sources. Pick one; they do not conflict.
+
+**Make** — the reference build:
+
 ```sh
 git submodule add https://github.com/cnlohr/ch32v003fun ch32v003fun
-make            # build
+make            # build the player
 make flash      # WCH-LinkE over SWIO (PD1)
-make monitor    # printf over PD5
+make monitor    # printf over the debug link
 ```
 
-## Audio
+**PlatformIO** — `platformio.ini`, for editor integration and one-click upload.
+The CH32V platform is community-maintained and is fetched from git on the first
+build, which takes a few minutes once:
 
 ```sh
-tools/wav2raw.py chant.wav chant.bin     # mono, 8 kHz, 8-bit + 16-byte header
+pio run -e player  -t upload      # the player
+pio run -e loader  -t upload      # the UART audio loader
+pio run -e leddemo -t upload      # the LED demo
 ```
 
-Then get `chant.bin` into U3 by CH341A, DediProg, or the UART loader — see
-`docs/audio-pipeline.md`.
+Three firmwares live in one `src/` tree, so each environment names its own files
+in `build_src_filter`. Add a .c file and you must add it in two places — the
+Makefile and the matching filter — or the two builds quietly diverge.
+
+The player's `printf` goes over SWIO, not a COM port, so `pio device monitor` will
+not show it; use `make monitor` or `minichlink -T`.
+
+## Getting the chant into the flash chip
+
+Convert the recording, then push it through the MCU into U3. Three commands, in
+this order — the loader and the player are two different firmwares and only one of
+them can be on the chip at a time.
+
+```sh
+ffmpeg -i chant.wav -ac 1 -ar 8000 -f u8 -acodec pcm_u8 chant.raw
+
+make -f Makefile.loader flash                  # loader onto the MCU
+python tools/send_chant.py COM7 chant.raw      # ~2 min for a full 1 MB, CRC-verified
+make flash                                     # player back onto the MCU
+```
+
+Wiring for the middle step (labels are MCU-side, so TX/RX cross): adapter RX → PD5,
+adapter TX → PD6, GND → GND. A WCH-LinkE doubles as the USB-serial adapter. Do not
+power the board from the adapter and the CR123A at once.
+
+Details and the wire protocol: [`src/loader/README.md`](src/loader/README.md) and
+[`docs/audio-pipeline.md`](docs/audio-pipeline.md). With the flash on a DIP adapter
+instead, a CH341A or DediProg writes `chant.raw` directly and skips all of this.
+
+No amp or flash chip yet? The same recording can drive an LED on a bare dev board,
+which exercises the PWM and the 8 kHz sample clock without either of them:
+
+```sh
+tools/wav2led.py chant.wav src/demo/chant_led.h   # -> C array in MCU flash
+make -f Makefile.leddemo flash
+```
+
+See `docs/led-demo.md` for wiring and the step-by-step.
