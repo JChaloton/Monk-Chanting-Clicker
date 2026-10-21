@@ -1,17 +1,21 @@
 # CLAUDE.md — chant-clicker
 
 Guidance for Claude Code working in this repo. Read `docs/` before changing anything
-electrical or timing-related; the numbers there were derived from datasheets and are
-not to be "improved" casually.
+electrical or timing-related; the numbers there were derived from datasheets and
+measured on hardware, and are not to be "improved" casually.
+
+Fastest orientation: [`docs/code-tour.md`](docs/code-tour.md) (every file, and why it is
+shaped that way), then [`docs/debug-log.md`](docs/debug-log.md) (the bugs that shaped it).
 
 ## What this is
 
-A ~30 mm keychain fidget clicker that plays a Buddhist monk chant when a blue
-mechanical key switch is pressed. Built by March (Thailand) as a gift his mother will
-give to a monk. It is also a deliberate learning project — March is doing the CAD,
-circuit design, and firmware himself — and a possible small product later.
+A ~30 mm keychain fidget clicker that plays a Buddhist monk chant when a blue mechanical
+key switch is pressed. Built by March (Thailand) as a gift his mother will give to a
+monk. It is also a deliberate learning project — March is doing the CAD, circuit design,
+and firmware himself — and a possible small product later.
 
 Design intent that follows from that:
+
 - The switch does **not** gate power or audio. It only signals the MCU; software does
   debounce, full-chant playback, amp shutdown, and sleep. Do not "simplify" this.
 - Battery is a replaceable primary cell (CR123A). Rechargeable Li-ion was ruled out on
@@ -39,85 +43,102 @@ Pin map (this is the contract between `board.h` and the schematic):
 | 18 PD1 | SWIO | J1 programming header (WCH-LinkE) — keep dedicated |
 | 19 PD2 | audio PWM, TIM1 CH1 | R1 → C1 low-pass → R2/R3 divider → C2 → U2 IN+ |
 | 20 PD3 | switch input, active-LOW, internal pull-up, EXTI wake | SW1 → GND |
-| 13 PC3 | amp enable, HIGH = play | U2 pin 4 SD (+ R5 100k pull-down) |
-| 14 PC4 | SPI CS# | U3 pin 1 (+ R6 10k pull-up) |
+| 13 PC3 | amp enable, HIGH = play | U2 pin 4 SD (+ R4 100k pull-down) |
+| 14 PC4 | SPI CS# | U3 pin 1 (+ 10k pull-up) |
 | 15 PC5 | SPI SCK | U3 pin 6 CLK |
 | 16 PC6 | SPI MOSI | U3 pin 5 DI |
 | 17 PC7 | SPI MISO | U3 pin 2 DO |
-| 4 PD7 | NRST | 10k pull-up (R4) |
+| 4 PD7 | NRST | 10k pull-up (R5) |
 | 2 PD5 / 3 PD6 | UART TX/RX | debug printf, and the audio loader |
+
+Reference designators: **R4 = 100k SD pull-down at the amp, R5 = 10k NRST pull-up.**
+`docs/hardware.md`'s passives table is authoritative if anything ever disagrees.
 
 ## Firmware facts that constrain the code
 
 - **No DAC.** Audio is 8-bit PWM on TIM1 CH1, 187.5 kHz carrier, **8 kHz sample rate**
   (one sample every 125 µs).
+- **The sample tick is TIM2**, `ATRLR = 5999` (48 MHz / 8000 = 6000 exactly). It is
+  **not** SysTick and must never become SysTick again: ch32fun builds `Delay_Us()` /
+  `Delay_Ms()` on the free-running SysTick counter, and taking it over hangs the
+  firmware inside `audio_stop()` with the amp still on. See `docs/debug-log.md`.
+- **The sample rate comes from the flash header**, not from `board.h`. `board.h`'s 8000
+  is only the default the host tools stamp. Swapping the chant is a reload, not a
+  firmware change.
 - **Audio lives in U3, never in MCU flash.** 16 KB of MCU flash is code only.
-  1 MB ≈ 2 min raw 8-bit/8 kHz, 4+ min as 4-bit IMA ADPCM.
-- **Double buffer, 2 × 256 B in RAM** (one flash page each). The PWM ISR plays buffer A
-  while the main loop refills B over SPI. RAM is 2 KB total — budget accordingly.
+  1 MB ≈ 2 min raw 8-bit/8 kHz. The current chant is 10.25 s = 82 KB, ~8 % of the chip.
+- **Double buffer, 2 × 256 B in RAM** (one flash page each). The TIM2 ISR plays buffer A
+  while the main loop refills B over SPI. **The ISR must never touch SPI.** RAM is 2 KB
+  total — budget accordingly.
 - **Power discipline is the product.** Amp SD LOW and flash in deep power-down (`B9h`,
-  wake `ABh`) whenever not playing; MCU in standby ≈ 9 µA. Skipping the flash
-  power-down alone blows the whole sleep budget.
+  wake `ABh`) whenever not playing; MCU standby ≈ 9 µA. Skipping the flash power-down
+  alone blows the whole sleep budget.
 - **Debounce ~20 ms** on PD3. Ramp PWM duty at start and stop to avoid pops.
-- Toolchain: **ch32v003fun**, driven either by the Makefiles or by PlatformIO
-  (`platformio.ini`, community `platform-ch32v`). Programmer: WCH-LinkE.
+- Toolchain: **ch32v003fun** (note: upstream renamed its header to `ch32fun.h` and its
+  makefile fragment to `ch32fun/ch32fun.mk`), driven either by PlatformIO
+  (`platformio.ini`, community `platform-ch32v`) or by the Makefiles. Programmer:
+  WCH-LinkE. **Flashing here is done with PlatformIO** — `pio run -e player -t upload`,
+  `pio run -e loader -t upload`, `python tools/load_audio.py --pio` — because `make flash`
+  does not work on this machine's Windows setup (`minichlink` WinUSB binding; see
+  `docs/hardware.md`). Lead with the `pio` commands; give the `make` ones only as the
+  cross-reference.
 
 ## Repo layout
 
 ```
 CLAUDE.md          this file
-docs/              hardware, firmware plan, audio pipeline, bring-up, decisions
+docs/              code tour, debug log, hardware, firmware, audio pipeline, bring-up, decisions
 src/               player firmware — main.c, audio.c, spiflash.c
 src/loader/        one-off UART→flash loader firmware (loader.c)
-src/demo/          LED demo: the timing core on a bare dev board
-tools/             send_chant.py (host → flash), wav2raw.py (stub), wav2led.py
+tools/             load_audio.py (do-it-all), send_chant.py, raw_resample.py,
+                   wav2raw.py (stub)
 scripts/           PlatformIO extra scripts
-Makefile           the player      -> make flash
+platformio.ini     the two firmwares as PlatformIO environments -> pio run -e player|loader -t upload
+Makefile           the player      -> make flash   /  make load      (reference build)
 Makefile.loader    the loader      -> make -f Makefile.loader flash
-Makefile.leddemo   the LED demo
-platformio.ini     the same three firmwares as PlatformIO environments
 ```
 
-**Two build systems, one set of sources.** The Makefiles are the reference;
-`platformio.ini` builds the identical files out of `src/`. PlatformIO compiles
-everything under `src/` by default and this tree holds three `main()`s, so each
-environment carries an explicit `build_src_filter`. **Adding a .c file means editing
-both** the matching Makefile's `ADDITIONAL_C_FILES` and that environment's filter —
-otherwise one build system silently links a different program than the other.
+**Two build systems, one set of sources.** `platformio.ini` is the one in use here; the
+Makefiles are the reference and build the identical files out of `src/`. PlatformIO compiles everything
+under `src/` by default and this tree holds two `main()`s, so each environment carries
+an explicit `build_src_filter`. **Adding a .c file means editing both** the matching
+Makefile's `ADDITIONAL_C_FILES` and that environment's filter — otherwise one build
+system silently links a different program than the other.
 
 ## Working rules
 
 1. **Datasheet wins.** Pin numbers and electrical limits come from the manufacturer
    datasheets only. Several hobby sites print a wrong PAM8302A pinout; the correct one
-   is `1 NC, 2 IN+, 3 IN−, 4 SD, 5 VO+, 6 VDD, 7 GND, 8 VO−`. If a source disagrees
-   with the datasheet, say so rather than silently averaging.
-2. **`board.h` is the single source of pin truth.** Never hard-code a port/pin in a
-   .c file. If a pin assignment changes, change it in `board.h` and in
-   `docs/hardware.md` in the same commit.
-3. **Don't break the sleep path.** Any new feature must answer: what is the current
-   draw when idle? Adding a peripheral that idles at tens of µA defeats the design.
-4. **Explain, don't just do.** March is learning the stack on this project. When
-   writing firmware, briefly say why a register/approach was chosen — especially for
-   timer, SPI, and low-power configuration. Keep it short; he has the background.
-5. **Stage changes like bring-up.** Prefer small, individually testable steps that map
+   is `1 NC, 2 IN+, 3 IN−, 4 SD, 5 VO+, 6 VDD, 7 GND, 8 VO−`. If a source disagrees with
+   the datasheet, say so rather than silently averaging.
+2. **`board.h` is the single source of pin truth.** Never hard-code a port/pin in a .c
+   file. If a pin assignment changes, change it in `board.h` and in `docs/hardware.md` in
+   the same commit.
+3. **Don't break the sleep path.** Any new feature must answer: what is the current draw
+   when idle? Adding a peripheral that idles at tens of µA defeats the design.
+4. **Don't break the timebase.** SysTick belongs to ch32fun's delays and to
+   `play_range()`'s independent rate measurement. The sample clock is TIM2.
+5. **Explain, don't just do.** March is learning the stack on this project. When writing
+   firmware, briefly say why a register/approach was chosen — especially for timer, SPI,
+   and low-power configuration. Keep it short; he has the background.
+6. **Stage changes like bring-up.** Prefer small, individually testable steps that map
    onto `docs/bring-up.md`.
-6. Comments and docs in English. Any user-facing product text may be Thai.
+7. Comments and docs in English. Any user-facing product text may be Thai.
 
-## Status
+## Status — 2026-09-11
 
-Hardware is built: everything is soldered onto perfboard around a CH32V003 dev board.
+**Working on hardware.** Perfboard build around a CH32V003 dev board; bring-up stages
+1–6 pass. The flash reads `A1 40 14`, `chant8k-limit.raw` (10.25 s, 8 kHz, 82 KB) is in
+U3 with a matching MCU-computed CRC32, and a press plays it at the right pitch and a
+useful volume.
 
-Firmware written and syntax-checked, **not yet run on hardware**:
-- `src/spiflash.c` — full FM25Q08B driver
-- `src/loader/loader.c` + `tools/send_chant.py` — UART → flash audio loader
-- `src/audio.c`, `src/main.c` — the player
-
-The load path was verified end to end against a Python model of the loader, so the
-framing, checksums, padding and CRC agree on both sides. Nothing has touched a real
-chip yet — work through `docs/bring-up.md` stages 4–6 in order.
+Three bugs found during that session, all fixed, all documented in `docs/debug-log.md`:
+the host reconfiguring the serial port mid-transaction, an unbounded loader read turning
+one dropped byte into spurious sector erases, and a 44.1 kHz chant loaded as 8 kHz. Plus
+the SysTick→TIM2 move above.
 
 Not implemented, on purpose: **step 7, MCU standby with EXTI wake.** The amp and the
-flash are already powered down between plays; what is left is the MCU's poll loop, a
-few mA. Fine on the bench, wrong for a keychain. See the header comment in `src/main.c`.
+flash are already powered down between plays; what is left is the MCU's poll loop, a few
+mA. Fine on the bench, wrong for a keychain. See the header comment in `src/main.c`.
 
 Open items are tracked in `docs/decisions.md`.
