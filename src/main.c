@@ -57,7 +57,7 @@ static int have_chant;
 
 static void amp_enable(int on)
 {
-    /* U2 SD is active LOW and R5 100k holds it there, so the amp is muted
+    /* U2 SD is active LOW and R4 100k holds it there, so the amp is muted
      * whenever this pin is low or floating — including during reset. */
     PIN_AMP_EN_PORT->BSHR = on ? (1u << PIN_AMP_EN_NUM)
                                : (1u << (PIN_AMP_EN_NUM + 16));

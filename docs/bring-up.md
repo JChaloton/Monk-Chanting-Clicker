@@ -6,7 +6,11 @@ added.
 
 **Where this build actually is: stages 1–6 pass.** The perfboard build around a
 CH32V003 dev board plays the chant on a press. Stage 7 (standby and the µA idle current)
-is not implemented. The bugs found on the way through are in
+is not implemented.
+
+**Since 2026-10-23 the whole sequence needs three wires, not five.** Stage 5b loads the
+chant over the same SWIO link that stages 2 onward already use, so there is no point in
+the build where a USB-serial adapter has to appear. The bugs found on the way through are in
 [`debug-log.md`](debug-log.md); read that before re-debugging anything that regresses.
 
 ## Stages
@@ -36,35 +40,40 @@ Those two numbers are the whole analog front end verified.
 ID command (`9Fh`) and print the reply: **`A1 40 14`**. Those three exact bytes prove all
 four SPI wires in both directions in one shot.
 
-Easiest way to see it: flash the player (`pio run -e player -t upload`) and run
-`pio device monitor`. It prints
-the ID at boot before anything else happens. `000000` means MISO (PC7) or the chip's 3 V
+Easiest way to see it on a board with PD5 wired: flash the player
+(`pio run -e player -t upload`) and run `pio device monitor`; it prints the ID at boot.
+**On a three-wire board use the loader instead** — `pio run -e loader_swio -t upload`
+then `python tools/swio_link.py`, which reports the same ID over SWIO and needs no
+serial port. `000000` means MISO (PC7) or the chip's 3 V
 is wrong; `ffffff` means CS# (PC4) never gets pulled low. Do not debug anything else
 until this one number is right. If it is intermittently wrong, **raise `FLASH_SPI_BR` in
 `board.h` (slower clock) before suspecting the solder** — long unshielded SCK/DO runs on
 perfboard are the usual cause.
 
-**5b — Load the chant.** ✅ Only once stage 5 passes. One command:
+**5b — Load the chant.** ✅ Only once stage 5 passes. One command, on the three wires
+stage 2 already has connected — nothing to re-plug:
 
 ```sh
-python tools/load_audio.py --pio    # loader -> MCU, audio -> U3 (CRC-verified), player -> MCU
+python tools/load_audio_swio.py     # loader -> MCU, audio -> U3 (CRC-verified), player -> MCU
 ```
 
-or by hand, which is the same three steps:
+~40 s. Make equivalent: `make load-swio`. Smaller first step if you want one:
 
 ```sh
-pio run -e loader -t upload                         # loader instead of the player
-pio run -e loader -t sendchant                      # ends with a CRC match
-pio run -e player -t upload                         # player back
+pio run -e loader_swio -t upload
+python tools/swio_link.py           # prints loader version and the JEDEC id
 ```
 
-(Make equivalents: `make load`, or `make -f Makefile.loader flash` /
-`python tools/send_chant.py COM7 chant8k-limit.raw` / `make flash`.)
+That smoke test is worth running on every new board. Its `JEDEC 0xa14014 ok` line is
+stage 5's test repeated from inside the loader, and it fails before anything is written.
 
-Wiring for the middle step and the wire protocol: [`../src/loader/README.md`](../src/loader/README.md).
-The loader also reports the JEDEC ID on request, so it is a second opinion on stage 5.
-This stage writes pages, erases sectors, and reads the whole chip back as a CRC — it is
-the "write a page, read it back, compare" test at full scale.
+This stage writes pages, erases sectors, and reads the whole chip back as a CRC — the
+"write a page, read it back, compare" test at full scale. A stall mid-transfer is safe
+to retry: the load erases and rewrites from address 0.
+
+(Route C, the UART loader, is still there for a board that wires PD5/PD6:
+`python tools/load_audio.py --pio`, or `make load`. See
+[`../src/loader/README.md`](../src/loader/README.md).)
 
 **6 — Add U2 + speaker.** ✅ With PC3 LOW: **silence** — this is the PAM8302A pinout
 sanity check, and it is free. Drive PC3 HIGH and play a test tone: a clean beep
@@ -89,8 +98,9 @@ in about ten seconds.
 in their < 1 µA states between plays, but the MCU polls, so bench idle is a few mA.
 
 Before attempting it, know the escape hatch: standby changes how the debug interface
-behaves, and if the WCH-LinkE stops connecting, `minichlink -u` power-cycle-unbricks the
-chip. Never reconfigure PD1.
+behaves, and if the WCH-LinkE stops connecting, a power-cycle unlock recovers the chip —
+`wlink erase --method power-off` on this machine, since `minichlink -u` cannot open the
+probe at all (`debug-log.md` #6). Never reconfigure PD1.
 
 ## Pre-power checklist — every time
 
@@ -107,7 +117,7 @@ chip. Never reconfigure PD1.
 - [ ] U3's WP# and HOLD# tied to the rail — a floating HOLD# causes maddening
       intermittent SPI failures.
 - [ ] Programmer and board share GND before flashing.
-- [ ] Not powering from the USB-serial adapter and the CR123A at the same time.
+- [ ] Not powering from the programmer's 3V3 and the CR123A at the same time.
 
 ## Known-good expected values
 
@@ -135,6 +145,9 @@ chip. Never reconfigure PD1.
 | `played 0 of N samples` | The TIM2 interrupt never fired — check `NVIC_EnableIRQ`, `DMAINTENR`, and that `INTFR` is cleared after `UG`. |
 | Plays, but slow / silent / an octave low | The file is not the rate its header claims. `debug-log.md` §4. |
 | Plays correctly but far too quiet | Crest factor. Re-run `raw_resample.py --limit 16`. `debug-log.md` §5. |
-| Loader answers `C` to every page | Host-side serial reconfiguration, or a bad link. `debug-log.md` §1–2. |
-| Programmer stops detecting U1 | Firmware reconfigured PD1. `minichlink -u`. |
+| Loader answers `C` to every page | Route C only: host-side serial reconfiguration, or a bad link. `debug-log.md` §1–2. |
+| SWIO load ends in a CRC32 mismatch | The per-chunk ack was skipped on a fast backend. `debug-log.md` #7. |
+| `WCH-Link failed to connect with riscvchip` | The probe is fine, the link to the chip is not: power, SWIO→PD1, shared GND. |
+| `libusb_open() = -5` from minichlink | Expected on this machine; use the OpenOCD backend. `debug-log.md` #6. |
+| Programmer stops detecting U1 | Firmware reconfigured PD1. `wlink erase --method power-off`. |
 | Hiss on perfboard | Partly normal for class-D on hand-wiring. Shorten the speaker and decoupling leads; verify on a real PCB before chasing it. |

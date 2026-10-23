@@ -16,7 +16,8 @@
 #define PIN_AUDIO_PORT      GPIOD
 #define PIN_AUDIO_NUM       2       /* PD2, U1 pin 19 -> R1 */
 
-/* Switch in — active LOW, internal pull-up, EXTI wake source. */
+/* Switch in — active LOW, internal pull-up. EXTI-capable, but the player polls it
+ * today; EXTI wake arrives with MCU standby (build step 7, not implemented). */
 #define PIN_SW_PORT         GPIOD
 #define PIN_SW_NUM          3       /* PD3, U1 pin 20 <- SW1 -> GND */
 

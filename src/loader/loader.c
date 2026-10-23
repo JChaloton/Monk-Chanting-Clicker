@@ -13,7 +13,9 @@
  *   adapter TX  -> PD6  (U1 pin 3, labelled RX on the header)
  *   adapter GND -- GND
  *
- * The labels are from the MCU's point of view, so they cross. 115200 8N1.
+ * The labels are from the MCU's point of view, so they cross. 8N1 at LOADER_BAUD
+ * (board.h) — 57600, halved from 115200 because the hand-wired link corrupted bytes
+ * faster than the resync machinery could recover. tools/send_chant.py must agree.
  *
  * PC3 (amp enable) is driven LOW first thing and never touched again — a loader
  * that makes noise while it works would be unpleasant and would also put a
@@ -91,9 +93,9 @@ static void uart_init(uint32_t baud)
     PIN_UART_PORT->BSHR   =  (1u << PIN_UART_RX_NUM);
 
     /* BRR holds 16 x USARTDIV as a plain integer: mantissa in [15:4], the
-     * sixteenths in [3:0]. 48 MHz / 115200 = 416.67 -> 417, which is 0.08 % off.
-     * The internal RC oscillator's own 1 % error dwarfs that, which is the real
-     * reason not to push this much past 115200. */
+     * sixteenths in [3:0]. 48 MHz / 57600 = 833.33 -> 833, which is 0.04 % off.
+     * The internal RC oscillator's own ~1 % error dwarfs that, which is the real
+     * reason not to push the baud rate up: the divisor is never the problem. */
     USART1->BRR   = (FUNCONF_SYSTEM_CORE_CLOCK + (baud / 2u)) / baud;
     USART1->CTLR2 = 0;              /* 1 stop bit */
     USART1->CTLR3 = 0;              /* no flow control */
@@ -119,7 +121,7 @@ static uint8_t uart_rx(void)
  * Both ends wedge, and the host's '?' resync bytes get eaten as page data.
  *
  * 50 ms is chosen to sit in the gap between the two timescales that matter:
- * far above the 87 us between bytes of a back-to-back burst at 115200 (so a
+ * far above the ~174 us between bytes of a back-to-back burst at 57600 (so a
  * healthy transfer never trips it, and USB's 1 ms frame scheduling cannot
  * either), and far below the host's 3 s status timeout (so we are back at the
  * command loop, having answered 'C', long before the host gives up). Because

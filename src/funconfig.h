@@ -5,7 +5,7 @@
  * build systems already put src/ on the include path (-Isrc), which is what
  * lets ch32fun.c find it while compiling inside the framework package.
  *
- * All three firmwares (player, loader, LED demo) share this file.
+ * Both firmwares (player and loader) share this file.
  */
 #ifndef _FUNCONFIG_H
 #define _FUNCONFIG_H

@@ -4,9 +4,9 @@
 #   python tools/send_chant.py COM7 chant.raw
 #   make flash                        put the player back
 #
-# Its own makefile for the same reason as Makefile.leddemo: the loader shares
-# board.h and spiflash.c with the product but is not part of it, and it must be
-# obvious which firmware is currently on the chip.
+# It gets its own makefile because the loader shares board.h and spiflash.c
+# with the product but is not part of it, and it must be obvious which firmware
+# is currently on the chip.
 #
 # It compiles src/loader/loader.c and src/spiflash.c only — no audio.c, no
 # main.c, so it cannot make a sound while it works.

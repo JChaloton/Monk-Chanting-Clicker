@@ -123,8 +123,13 @@ reload, not a firmware change.** `src/` is not touched at any point below.
 3. **Load it.** One command does all three firmware/transfer steps:
 
    ```sh
-   python tools/load_audio.py --pio chant8k-limit.raw
+   python tools/load_audio_swio.py chant8k-limit.raw     # SWIO only, route D
+   python tools/load_audio.py --pio chant8k-limit.raw    # UART on PD5/PD6, route C
    ```
+
+   Use the first on any board that has nothing wired to PD5/PD6 — it needs only the
+   WCH-LinkE that is already attached. The rest of this step describes the UART route;
+   the SWIO one takes the same `.raw` and produces the same bytes in U3.
 
    `tools/load_audio.py` runs loader → MCU, audio → SPI flash, player → MCU; `--pio`
    selects the PlatformIO environments as the build backend. The port is auto-detected
@@ -147,10 +152,14 @@ reload, not a firmware change.** `src/` is not touched at any point below.
    Make equivalent of the one-liner: `make load CHANT=chant8k-limit.raw`, with
    `PORT=COM7` to name the port.
 
-4. **Check the player's log.** `pio device monitor` for the PlatformIO build (printf on
-   PD5 at 115200), or `make monitor` for the Makefile one — they route printf
-   differently, SWIO vs PD5; see the README. It prints the header it found and, after
-   each play, the rate it measured:
+4. **Check it played.** On the current three-wire board the simplest check is the one
+   that matters: press the switch. The load already proved itself with a CRC32 the MCU
+   computed over the whole image, which is a stronger check than reading a log.
+
+   **The player's printf is not reachable on this board** — `[env:player]` sends it to
+   PD5, which is not wired, and the SWIO alternative needs `minichlink -T`, which cannot
+   open this probe. On a board that *does* wire PD5, `pio device monitor` at 115200
+   prints the header it found and, after each play, the rate it measured:
 
    ```
    chant: fmt 0, 8000 Hz, 81968 bytes (~10 s)
@@ -159,7 +168,8 @@ reload, not a firmware change.** `src/` is not touched at any point below.
 
    If the byte count and duration match what you exported, it is right. `played` far
    short of the length means an underrun; `played 0` means the sample interrupt never
-   fired.
+   fired. Without that log, the symptoms in [`bring-up.md`](bring-up.md)'s "If it goes
+   wrong" table are what you have to go on.
 
 Limits worth knowing before picking a chant: `spiflash_read_header()` accepts rates from
 **2000 to 24000 Hz** and a length up to **1 MB minus the 16-byte header**, which is ~2
@@ -186,7 +196,12 @@ A header costs nothing and means the player reads the length instead of having i
 recompiled in. Keep the writer (`tools/`) and the reader (`src/spiflash.c`) in agreement
 — if the header changes, change both in the same commit.
 
-## Getting the bytes in — three routes
+## Getting the bytes in — four routes
+
+Every one of them writes U3 over SPI, because SPI is the only interface the chip has.
+What differs is how the bytes get from the PC to the SPI bus: an external programmer
+driving it directly (A, B), or the MCU driving it on the host's behalf (C, D). A and B
+need the flash reachable by a clip; C and D work with it soldered down.
 
 **A. CH341A USB programmer (simplest while the flash is on a DIP adapter).** Write the
 chip on the desk with the adapter in the clip, then plug it into the board. Write
@@ -198,7 +213,7 @@ touching the MCU firmware.
 is the route for batch programming if the project ever becomes a small product — worth
 confirming FM25Q08B is in the DediProg device list early.
 
-**C. UART loader firmware — the in-circuit route, and the one that is used.** A one-off
+**C. UART loader firmware — in-circuit, needs a serial adapter on PD5/PD6.** A one-off
 firmware in `src/loader/` receives the blob over PD5 TX / PD6 RX and writes it to U3 page
 by page. It is flashed *instead of* the player, so a load is always three steps:
 
@@ -225,7 +240,72 @@ time.**
 Timing: 57600 baud, 261 bytes per page plus a status byte, so ~450 KB takes about 86 s
 including erase and verification. The 82 KB chant takes about 16 s.
 
-The wire protocol lives in [`../src/loader/README.md`](../src/loader/README.md). In
+**D. SWIO loader firmware — in-circuit over the programming wire alone. The route for
+boards with nothing on PD5/PD6.** Same idea as C and the same SPI writing underneath,
+but the host reaches the MCU over the single SWIO wire (PD1) that the WCH-LinkE already
+uses to program it. No serial adapter, no second cable, no UART pins required:
+
+```sh
+python tools/load_audio_swio.py                     # all three steps
+python tools/load_audio_swio.py other.raw --rate 8000
+```
+
+Make equivalent: `make load-swio CHANT=other.raw`.
+
+It flashes `src/loader/loader_swio.c`, pushes the image, verifies, and puts the player
+back — the same three steps as C, and step 3 still runs if step 2 fails.
+
+The transport is a **RAM mailbox**, not a byte stream. A debug probe can read and write
+target memory: the host halts the core, drops a 512-byte request straight into the
+loader's RAM at `0x20000300`, resumes, and the loader programs it out over SPI. No wire
+protocol, nothing to resync. `tools/swio_link.py` is the host half; the mailbox layout
+and command set are documented at the top of `src/loader/loader_swio.c` and the two must
+change together.
+
+### Backends — which tool drives the probe
+
+`swio_link.py` can drive the WCH-LinkE two ways, and **which one works depends on the
+driver bound to the probe**, not on preference:
+
+| backend | per chunk | notes |
+|---|---|---|
+| `openocd` (default) | ~170 ms | one process stays up for the whole load, commands over its TCL port |
+| `minichlink` | ~500 ms | one process per chunk, all of it USB re-enumeration |
+
+**Measured end to end on hardware: 40 s** for the 82 KB chant on the OpenOCD backend —
+3.5 s to flash the loader, ~30 s of transfer and CRC, 4.7 s to flash the player back.
+That is ~1800 TCL round trips; the SPI writing itself is milliseconds.
+
+**On this machine only OpenOCD works.** The WCH-LinkRV interface is bound to WCH's own
+driver, which OpenOCD and `wlink` talk to; minichlink wants a WinUSB binding and fails
+with `libusb_open() = -5`. That is the same thing that makes `make flash` fail — see
+[`hardware.md`](hardware.md). OpenOCD comes from PlatformIO's `tool-openocd-riscv-wch`,
+which is already installed because `pio run -t upload` uses it.
+
+`--backend minichlink` forces the other one, `CHANT_OPENOCD` / `CHANT_MINICHLINK`
+override the paths, and `auto` prefers OpenOCD and says so if it falls back.
+
+The host reads an acknowledgement after every chunk on the OpenOCD backend, and this is
+**required for correctness, not a safety belt**. What matters between two chunks is not
+elapsed time but how long the core is actually *running*, and nearly all of an OpenOCD
+chunk is spent halted: halt, write the scratch file, `load_image`, resume — the loader
+only executes between that resume and the next halt, a few milliseconds against up to
+6 ms of page programming. Skipping the ack here produces a clean-looking run that fails
+the final CRC32. See [`debug-log.md`](debug-log.md) #7.
+
+On minichlink the ack is skipped, safely, for the opposite reason: the core runs for the
+whole ~250 ms of the next process's startup and USB enumeration. Either way sector
+erases, which take up to 300 ms, are waited on, and a CRC32 over the whole image at the
+end catches anything that slipped. `--verify-each` forces the ack on both.
+
+One thing that looks like it should work and does not: **ch32fun's SWIO printf channel**.
+It moves three bytes per USB round trip — tens of thousands of transactions for 82 KB —
+and on Windows minichlink reads the host end of it with `_kbhit()`/`_getch()`, which only
+see a real console. Nothing can pipe into it from a script.
+
+**D needs no pyserial and no COM port.**
+
+The wire protocol for route C lives in [`../src/loader/README.md`](../src/loader/README.md). In
 short: one ASCII byte per command, every reply starting with a status byte, fixed
 256-byte pages with a checksum, and a CRC32 the MCU computes over the whole image at the
 end. The firmware does the usual dance internally — `06h` write enable before each page

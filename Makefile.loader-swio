@@ -1,0 +1,40 @@
+# Makefile.loader-swio — the one-off SWIO -> SPI-flash loader firmware.
+#
+#   make -f Makefile.loader-swio flash     write the SWIO loader to the MCU
+#   python tools/load_audio_swio.py --minichlink
+#   make flash                             put the player back
+#
+# Or just `python tools/load_audio_swio.py`, which does all three through
+# PlatformIO and is the documented route — see docs/audio-pipeline.md route D.
+#
+# Same shape as Makefile.loader, and for the same reason: this firmware shares
+# board.h and spiflash.c with the product but is not part of it, and it must be
+# obvious which firmware is currently on the chip.
+#
+# It compiles src/loader/loader_swio.c and src/spiflash.c only — no audio.c, no
+# main.c, so it cannot make a sound while it works.
+
+TARGET      := src/loader/loader_swio
+CH32V003FUN ?= ch32v003fun/ch32fun
+MINICHLINK  ?= ch32v003fun/minichlink
+
+TARGET_MCU  := CH32V003
+
+ADDITIONAL_C_FILES := src/spiflash.c
+
+# -Isrc so loader_swio.c finds board.h, which sits one directory up.
+# The printf switches must match platformio.ini's [env:loader_swio]: ch32fun's
+# SWIO printf would be a second user of the debug channel this loader's host
+# drives, and NULL_PRINTF keeps the formatter out of a 16 KB flash.
+CFLAGS += -Isrc -DFUNCONF_USE_DEBUGPRINTF=0 -DFUNCONF_USE_UARTPRINTF=0 \
+          -DFUNCONF_NULL_PRINTF=1
+
+include $(CH32V003FUN)/ch32fun.mk
+
+.PHONY: flash clean-all
+
+flash: $(TARGET).bin
+	$(MINICHLINK)/minichlink -w $< flash -b
+
+clean-all: clean
+	rm -f $(TARGET).bin $(TARGET).elf $(TARGET).map

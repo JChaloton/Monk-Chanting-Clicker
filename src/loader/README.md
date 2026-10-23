@@ -136,3 +136,29 @@ Erases and pages each retry (`--retries`, default 3) with a `sync()` between att
 and there is an explicit resync at the erase→program boundary — page 0 carries the `CHNT`
 header the player looks for, and it is the worst place to discover the link is out of
 step.
+
+## The SWIO loader — no UART at all
+
+`loader_swio.c` is the same job as `loader.c` for a board that has nothing wired to
+PD5/PD6. The host reaches it over the single SWIO wire (PD1) the WCH-LinkE already uses
+for programming, so the probe is the only thing connected. This is route D in
+[`../../docs/audio-pipeline.md`](../../docs/audio-pipeline.md), and on the current board
+revision it is the only in-circuit route.
+
+```sh
+python tools/load_audio_swio.py                   # loader -> audio -> player
+python tools/load_audio_swio.py --verify-each     # slower, localises a CRC failure
+python tools/swio_link.py                         # smoke test: probe, loader, JEDEC id
+```
+
+There is no wire protocol to resync, because there is no wire. The host halts the core,
+writes a request into a fixed RAM mailbox at `0x20000300`, resumes, and the loader
+programs it out over SPI. Layout and command set are documented at the top of
+`loader_swio.c`; `tools/swio_link.py` is the host half and the two must change together.
+
+Two backends can drive the probe, and **which one works depends on the driver bound to
+it**. OpenOCD (the default) keeps one process up for the whole load: 40 s end to end,
+measured. minichlink spawns a process per chunk and is roughly three times slower. On this machine only
+OpenOCD works — minichlink cannot open this probe at all (`libusb_open() = -5`), which
+is the same reason `make flash` fails. `--backend minichlink` forces the other one.
+See the Backends table in `docs/audio-pipeline.md`.

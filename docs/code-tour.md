@@ -1,8 +1,8 @@
 # Code tour — every file, what it does, and why it is shaped that way
 
 This is the document to read first when you come back to this project cold. It walks
-the tree in the order the bytes actually flow: recording → host tool → UART → SPI flash
-→ MCU RAM → PWM → speaker. Where a line of code is non-obvious, the reason it is that
+the tree in the order the bytes actually flow: recording → host tool → debug link →
+SPI flash → MCU RAM → PWM → speaker. Where a line of code is non-obvious, the reason it is that
 way is here, not only in the source.
 
 Companions: [`hardware.md`](hardware.md) for the circuit,
@@ -20,7 +20,12 @@ of this project.
 | Firmware | Sources | Built by | What it is for |
 |---|---|---|---|
 | **player** | `main.c` `audio.c` `spiflash.c` | `pio -e player` / `make` | the product: press switch → chant |
-| **loader** | `loader/loader.c` `spiflash.c` | `pio -e loader` / `make -f Makefile.loader` | one-off: host → UART → SPI flash |
+| **loader_swio** | `loader/loader_swio.c` `spiflash.c` | `pio -e loader_swio` / `make -f Makefile.loader-swio` | one-off: host → SWIO → SPI flash. **The one in use.** |
+| **loader** | `loader/loader.c` `spiflash.c` | `pio -e loader` / `make -f Makefile.loader` | one-off: host → UART → SPI flash. Needs PD5/PD6. |
+
+Three images now, not two. `loader_swio` exists because the current board wires nothing
+to PD5/PD6: it takes the audio over the same single wire that programs the chip. Both
+loaders write U3 through the identical `spiflash.c`; only the transport differs.
 
 Shared by both: `board.h` (pins and timing constants), `funconfig.h` (ch32fun build
 config), and `spiflash.c`.
@@ -29,8 +34,10 @@ Host-side Python, none of it needed at runtime:
 
 | Tool | Role |
 |---|---|
-| `tools/load_audio.py` | **the one command you want**: flash loader → send audio → flash player back |
-| `tools/send_chant.py` | speaks the loader's wire protocol; builds the 16-byte header |
+| `tools/load_audio_swio.py` | **the one command you want**: flash loader → send audio over SWIO → flash player back |
+| `tools/swio_link.py` | the SWIO half: OpenOCD/minichlink backends and the RAM mailbox |
+| `tools/load_audio.py` | the same three steps for route C, over a serial port |
+| `tools/send_chant.py` | speaks the UART loader's wire protocol; builds the 16-byte header |
 | `tools/raw_resample.py` | fixes a `.raw`'s real sample rate; high-pass, limiter, normalise |
 | `tools/wav2raw.py` | **stub**, never finished; ffmpeg + `raw_resample.py` do its job |
 | `scripts/pio_send_chant.py` | exposes `send_chant.py` as `pio run -e loader -t sendchant` |
@@ -57,7 +64,7 @@ The constants that are not pins, and what depends on them:
 | `SW_DEBOUNCE_MS` | 20 | a blue mechanical switch chatters for a few ms. |
 
 `PD1` is SWIO. Never configure it as GPIO — you can lock the WCH-LinkE out of the chip
-and need `minichlink -u` (power-cycle unlock) to get back in.
+and need a power-cycle unlock to get back in (`wlink erase --method power-off`; `minichlink -u` cannot open this machine's probe — `debug-log.md` #6).
 
 ## `src/funconfig.h` — ch32fun build configuration
 
@@ -72,12 +79,17 @@ Three things are decided here:
   Every audio number descends from this: 48 MHz / 256 = 187.5 kHz carrier,
   48 MHz / 8000 = 6000 for the sample tick.
 - **Where `printf` goes.** The ch32fun default is SWIO (PD1), read back with
-  `make monitor` / `minichlink -T` — no COM port involved. The `#ifndef` guards exist so
+  `minichlink -T` — no COM port involved, and **not usable on this machine**, where
+  minichlink cannot open the probe. The `#ifndef` guards exist so
   that *one* PlatformIO environment can override it, which is what the PlatformIO build
   this project uses does: `[env:player]` passes `-DFUNCONF_USE_UARTPRINTF=1
   -DFUNCONF_USE_DEBUGPRINTF=0`, putting printf on PD5 at 115200 where any USB-serial
-  adapter can read it. **The player only.** The loader configures USART1 itself at
-  register level; two owners of one peripheral is silent corruption, not a link error.
+  adapter can read it. **The player only**, and only on a board that wires PD5.
+  `loader.c` configures USART1 itself at register level (two owners of one peripheral is
+  silent corruption, not a link error), and `loader_swio.c` compiles printf out
+  entirely, because ch32fun's SWIO printf would contend with the debug channel its own
+  host is driving. On the current three-wire board neither printf route reaches
+  anything — see [`decisions.md`](decisions.md).
 - **`FUNCONF_SYSTICK_USE_HCLK 0`** → SysTick runs at HCLK/8 = **6 MHz**, so
   `DELAY_MS_TIME == 6000`. Any code converting SysTick counts to milliseconds (see
   `play_range()`) depends on that number.
@@ -280,9 +292,39 @@ chant you can load.
 
 ---
 
-## The loader
+## The loaders
 
-### `src/loader/loader.c`
+### `src/loader/loader_swio.c` — the one in use
+
+Same job as `loader.c`, same `spiflash.c` underneath, no UART. The host reaches it over
+the WCH-LinkE's single SWIO wire, so a board with nothing on PD5/PD6 still loads a chant.
+
+**A RAM mailbox, not a byte stream.** A debug probe can read and write target memory, so
+the host halts the core, drops a 512-byte request into a fixed struct at `0x20000300`,
+resumes, and the loader programs it out over SPI. There is no wire protocol, nothing to
+resync, and no timeouts on either side. Commands: ping, JEDEC id, unprotect, sector
+erase, program, CRC32 — the same set `loader.c` exposes as ASCII opcodes.
+
+Three things in that file that look arbitrary and are not:
+
+- **The mailbox address is a constant,** because the host must know it without parsing
+  the ELF. `0x20000300` sits above this firmware's .data/.bss (256 B) and below the
+  stack (from `0x20000800`). `main()` checks the lower boundary at boot and hangs
+  deliberately if .bss ever grows into it — a host-side timeout with a clear message
+  beats silent corruption.
+- **`do_program()` copies out of the mailbox into `page[]` before programming.** The
+  host can halt the core and overwrite `data[]` at any instant; programming from a
+  private copy means the worst case is a stale page, which the CRC32 catches, rather
+  than a page spliced from two chunks.
+- **printf is compiled out** (`-DFUNCONF_USE_DEBUGPRINTF=0 -DFUNCONF_NULL_PRINTF=1` in
+  both build systems). ch32fun's SWIO printf uses the debug module's data registers,
+  which is exactly the channel this loader's host is driving. Two owners, one channel.
+
+Why not ch32fun's SWIO printf channel as the transport, which looks ideal: it moves
+three bytes per USB round trip, and on Windows minichlink reads the host end with
+`_kbhit()`/`_getch()`, which only see a real console — no script can pipe into it.
+
+### `src/loader/loader.c` — route C, the UART one
 
 Flashed *instead of* the player. Receives the blob over UART and writes it into U3 page
 by page. It is deliberately dumb: the host drives everything and the MCU executes one
@@ -338,7 +380,34 @@ Design points:
 
 ## Host tools
 
-### `tools/load_audio.py` — the one you actually run
+### `tools/swio_link.py` — the SWIO transport
+
+Two backends behind one interface, because which one can open the probe depends on the
+machine, not on preference. `openocd` (the default) keeps one process up for the whole
+load and drives it over its TCL port; `minichlink` spawns a process per chunk. On this
+project's machine only OpenOCD works — see [`debug-log.md`](debug-log.md) #6.
+
+The one piece of hard-won behaviour here: **on a fast backend the per-chunk
+acknowledgement is required for correctness.** What matters between two chunks is not
+elapsed time but how long the core is actually *running*, and nearly all of an OpenOCD
+chunk is spent halted. `debug-log.md` #7 has the measurement.
+
+### `tools/load_audio_swio.py` — the one you actually run
+
+```sh
+python tools/load_audio_swio.py
+python tools/load_audio_swio.py other.raw --rate 8000
+```
+
+Flash `loader_swio` → push the audio over SWIO → CRC32 → flash the player back. ~40 s.
+Step 3 runs even when step 2 fails, for the same reason as route C's version.
+
+One structural detail worth knowing before editing it: **it opens the probe only
+between the flashing steps, never across one.** PlatformIO launches its own OpenOCD to
+upload, and two processes cannot own one WCH-Link — which is why `flash_firmware()`
+takes `args` rather than a live link.
+
+### `tools/load_audio.py` — route C's equivalent
 
 ```sh
 python tools/load_audio.py --pio                            # chant8k-limit.raw, port auto-detected
@@ -462,9 +531,11 @@ the debug probe's SWIO interface, not the serial adapter on PD5/PD6.
 
 **Two build systems, one set of sources.** `platformio.ini` is what this project is
 flashed with (see [`hardware.md`](hardware.md#windows-the-driver-and-why-platformio-is-the-easier-route));
-the Makefiles remain the reference build and compile the identical files. PlatformIO compiles everything under `src/`
-by default and this tree holds two `main()`s, so each environment carries an explicit
-`build_src_filter` that starts with `-<*>` to clear the default.
+the Makefiles remain the reference build and compile the identical files. PlatformIO
+compiles everything under `src/` by default and this tree now holds **three** `main()`s,
+so each environment carries an explicit `build_src_filter` that starts with `-<*>` to
+clear the default. The Makefile side is one file per image: `Makefile` (player),
+`Makefile.loader` (UART), `Makefile.loader-swio` (SWIO).
 
 > **Adding a `.c` file means editing two places**: the matching Makefile's
 > `ADDITIONAL_C_FILES` and that environment's `build_src_filter`. Otherwise one build

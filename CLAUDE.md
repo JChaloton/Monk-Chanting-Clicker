@@ -49,10 +49,18 @@ Pin map (this is the contract between `board.h` and the schematic):
 | 16 PC6 | SPI MOSI | U3 pin 5 DI |
 | 17 PC7 | SPI MISO | U3 pin 2 DO |
 | 4 PD7 | NRST | 10k pull-up (R5) |
-| 2 PD5 / 3 PD6 | UART TX/RX | debug printf, and the audio loader |
+| 2 PD5 / 3 PD6 | **not wired** (USART1 if ever needed) | was printf + the UART loader on the perfboard |
 
 Reference designators: **R4 = 100k SD pull-down at the amp, R5 = 10k NRST pull-up.**
 `docs/hardware.md`'s passives table is authoritative if anything ever disagrees.
+
+**PD5/PD6 are not wired on the current board revision.** The table's PD5/PD6 row
+describes the perfboard the firmware was brought up on. On the current board SWIO is the
+only host connection: three wires (SWIO→PD1, GND, 3V3) flash the firmware *and* load the
+chant, via `python tools/load_audio_swio.py` (route D in `docs/audio-pipeline.md`).
+**Consequence: the player's printf has no working route on this board** — PD5 is not
+wired and `minichlink -T` cannot open this probe. Treat the boot log as unavailable and
+use the loader's JEDEC check and the CRC32 instead; see `docs/decisions.md`.
 
 ## Firmware facts that constrain the code
 
@@ -78,10 +86,13 @@ Reference designators: **R4 = 100k SD pull-down at the amp, R5 = 10k NRST pull-u
   makefile fragment to `ch32fun/ch32fun.mk`), driven either by PlatformIO
   (`platformio.ini`, community `platform-ch32v`) or by the Makefiles. Programmer:
   WCH-LinkE. **Flashing here is done with PlatformIO** — `pio run -e player -t upload`,
-  `pio run -e loader -t upload`, `python tools/load_audio.py --pio` — because `make flash`
-  does not work on this machine's Windows setup (`minichlink` WinUSB binding; see
-  `docs/hardware.md`). Lead with the `pio` commands; give the `make` ones only as the
-  cross-reference.
+  `pio run -e loader_swio -t upload`, `python tools/load_audio_swio.py` — because
+  `make flash` does not work on this machine's Windows setup. Lead with the `pio`
+  commands; give the `make` ones only as the cross-reference.
+- **Never hand him a `minichlink` command.** Measured 2026-10-23: minichlink cannot open
+  this probe at all (`libusb_open() = -5`, WinUSB not bound). OpenOCD and `wlink` can.
+  The unbrick is `wlink erase --method power-off`, not `minichlink -u`. See
+  `docs/debug-log.md` #6.
 
 ## Repo layout
 
@@ -89,13 +100,14 @@ Reference designators: **R4 = 100k SD pull-down at the amp, R5 = 10k NRST pull-u
 CLAUDE.md          this file
 docs/              code tour, debug log, hardware, firmware, audio pipeline, bring-up, decisions
 src/               player firmware — main.c, audio.c, spiflash.c
-src/loader/        one-off UART→flash loader firmware (loader.c)
-tools/             load_audio.py (do-it-all), send_chant.py, raw_resample.py,
-                   wav2raw.py (stub)
+src/loader/        one-off loader firmwares: loader.c (UART), loader_swio.c (SWIO)
+tools/             load_audio.py (do-it-all, UART), load_audio_swio.py (do-it-all, SWIO),
+                   swio_link.py, send_chant.py, raw_resample.py, wav2raw.py (stub)
 scripts/           PlatformIO extra scripts
-platformio.ini     the two firmwares as PlatformIO environments -> pio run -e player|loader -t upload
-Makefile           the player      -> make flash   /  make load      (reference build)
-Makefile.loader    the loader      -> make -f Makefile.loader flash
+platformio.ini     three firmwares as PlatformIO environments -> pio run -e player|loader|loader_swio -t upload
+Makefile           the player      -> make flash  /  make load  /  make load-swio
+Makefile.loader    the UART loader -> make -f Makefile.loader flash
+Makefile.loader-swio  the SWIO loader -> make -f Makefile.loader-swio flash
 ```
 
 **Two build systems, one set of sources.** `platformio.ini` is the one in use here; the
@@ -125,7 +137,25 @@ system silently links a different program than the other.
    onto `docs/bring-up.md`.
 7. Comments and docs in English. Any user-facing product text may be Thai.
 
-## Status — 2026-09-11
+## Status — 2026-10-23
+
+**Route D works on hardware.** The chant now loads over the WCH-LinkE's SWIO wire
+alone, with nothing on PD5/PD6: `python tools/load_audio_swio.py` runs loader → audio
+→ player in 40 s, the MCU-computed CRC32 matches the host, and the chant plays
+correctly from the switch. This is the route for the board being laid out now.
+
+Two things that session established and that are easy to get wrong again — both in
+`docs/debug-log.md` (#6, #7):
+
+- **`minichlink` cannot open this machine's probe at all** (`libusb_open() = -5`); it
+  is bound to WCH's driver, which OpenOCD and `wlink` use. The earlier note said only
+  that `make flash` failed. Nothing in this tree may assume minichlink runs here.
+- **On the OpenOCD backend the per-chunk acknowledgement is required for correctness**,
+  not an optimisation to remove: nearly all of a chunk is spent with the core halted,
+  so the loader gets only a few milliseconds of run time against up to 6 ms of page
+  programming.
+
+### Earlier — 2026-09-11
 
 **Working on hardware.** Perfboard build around a CH32V003 dev board; bring-up stages
 1–6 pass. The flash reads `A1 40 14`, `chant8k-limit.raw` (10.25 s, 8 kHz, 82 KB) is in

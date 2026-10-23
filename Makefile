@@ -17,10 +17,26 @@ CFLAGS_EXTRA := -Isrc
 # ch32v003fun ships a ready-made rules file; this is the whole build.
 include $(CH32V003FUN)/ch32fun.mk
 
-.PHONY: flash monitor clean-all
+.PHONY: flash load load-swio monitor clean-all
 
 flash: $(TARGET).bin
 	$(MINICHLINK)/minichlink -w $< flash -b
+
+# The whole audio-load cycle in one command: loader -> MCU, audio -> SPI flash,
+# player -> MCU. Override the file or port from the command line:
+#   make load CHANT=other.raw PORT=COM9
+# PORT may be left unset; load_audio.py auto-detects it.
+CHANT ?= chant8k-limit.raw
+PORT  ?=
+
+load:
+	python tools/load_audio.py $(CHANT) $(if $(PORT),--port $(PORT),)
+
+# The same cycle with no UART at all: the WCH-LinkE's SWIO wire carries the
+# audio too. This is the route for boards that have nothing on PD5/PD6.
+#   make load-swio CHANT=other.raw
+load-swio:
+	python tools/load_audio_swio.py $(CHANT)
 
 # Debug printf over PD5 (UART TX) once you wire a USB-serial dongle.
 monitor:

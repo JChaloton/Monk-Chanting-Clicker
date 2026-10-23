@@ -14,6 +14,12 @@ dev board and works — bring-up stages 1–6 pass and the clicker plays the cha
 unverified number in this document is the ~9 µA idle figure, which depends on MCU standby
 that is not implemented yet. See [`bring-up.md`](bring-up.md).
 
+**Changed 2026-10-23 — the board is now a three-wire board.** PD5/PD6 carry no UART on
+the current revision, and nothing needs them to: the chant loads over the SWIO wire that
+already programs the chip. One connector, three wires, whole pipeline. Everything in
+this file that used to require a serial adapter is marked as the perfboard's history
+rather than the board's requirement. See [The WCH-LinkE](#the-wch-linke--pins-and-how-to-hook-it-up).
+
 ## Blocks
 
 CR123A → SW2 (master power) → 3 V rail → { U1 MCU, U2 amp, U3 flash }.
@@ -59,8 +65,8 @@ crystal, and PA1/PA2 stay free.
 | Pin | Name | Use | Why this pin |
 |---|---|---|---|
 | 1 | PD4 | — | spare |
-| 2 | PD5 | UART TX (debug / loader) | printf-style debugging, audio loader |
-| 3 | PD6 | UART RX (loader) | spare otherwise |
+| 2 | PD5 | **not wired** (USART1 TX if ever needed) | was printf + UART loader on the perfboard |
+| 3 | PD6 | **not wired** (USART1 RX if ever needed) | was the UART loader's RX |
 | 4 | PD7 | NRST + R5 10k pull-up (optional) | keeps reset firmly high |
 | 5 | PA1 | — | free, internal osc used |
 | 6 | PA2 | — | free |
@@ -79,6 +85,13 @@ crystal, and PA1/PA2 stay free.
 
 Only PD2 (TIM1 CH1) and PC5/PC6/PC7 (SPI) are hard constraints. PC3, PC4, PD3 could
 move to any free GPIO.
+
+**On PD5/PD6.** The perfboard wired them as USART1 for printf and for the original UART
+chant loader (route C). The current board does not, and the schematic labels them
+`USB_P`/`USB_N` — a label to fix, because **the CH32V003F4P6 has no USB peripheral**.
+Nothing in the firmware needs them now; `src/loader/loader_swio.c` carries the audio
+over SWIO instead. Leave them as spare GPIO, or break them out as a 2-pin test header
+if you ever want route C back.
 
 **J1 programming header:** 3 pins — 3 V, SWIO (PD1), GND. Two rules learned the hard
 way: never reconfigure PD1 as ordinary GPIO in firmware (you can lock the programmer
@@ -111,19 +124,25 @@ line. So J1 is 3 pins and nothing more:
 | `GND` | J1 GND | **never optional** — see below |
 | `3V3` | J1 3 V | only when the CR123A is out; SW2 off |
 | `SWCLK` | *(nothing)* | not used by this chip; leave it unconnected |
-| `RST` | *(nothing)* | NRST/PD7 has R5 to the rail; `minichlink` does not need it |
+| `RST` | *(nothing)* | NRST/PD7 has R5 to the rail; the probe does not need it |
 
 Then:
 
 ```sh
 pio run -e player -t upload     # flash the player over SWIO
-pio device monitor              # printf, PD5 @ 115200
 ```
 
-Make equivalents, for the reference build: `make flash` and `make monitor` — but note
-that `make monitor` reads printf back over the *SWIO* wire rather than a COM port, and on
-Windows `make flash` needs the driver binding described in
-[Windows: the driver](#windows-the-driver-and-why-platformio-is-the-easier-route) below.
+**Reading printf on a three-wire board is an open problem.** `[env:player]` sends printf
+to PD5 at 115200, which needs a wire this board does not have; the Makefile build sends
+it over SWIO instead, read with `minichlink -T`, which cannot open this probe. The
+candidate is `wlink sdi-print`, WCH's own SWIO console — **untested here**, and whether
+it agrees with ch32fun's debug-printf framing is unverified. Until someone tries it,
+treat the player's boot log as unavailable on this board and lean on the loader's JEDEC
+check and the CRC32 instead. Tracked in [`decisions.md`](decisions.md).
+
+Make equivalent, for the reference build: `make flash` — but on Windows it goes through
+`minichlink`, which does not work here at all; see
+[Which tool can actually drive the probe](#which-tool-can-actually-drive-the-probe).
 
 Three rules, all of them learned the hard way somewhere:
 
@@ -140,13 +159,30 @@ Three rules, all of them learned the hard way somewhere:
   the wrong mode simply does not see the chip.
 
 **Never reconfigure PD1 as ordinary GPIO in firmware.** You can lock the programmer out
-of the chip; the way back is `minichlink -u`, which power-cycle-unlocks it. This is also
-why PD1 carries no other function in `board.h`.
+of the chip; the way back is a power-cycle unlock — `wlink erase --method power-off`
+on this machine, since `minichlink -u` cannot open the probe. This is also why PD1
+carries no other function in `board.h`.
 
-### Loading audio — 3 more wires, different pins
+### Loading audio — the same three wires
 
-The same dongle exposes a USB-CDC serial port, which is what `send_chant.py` talks to.
-Labels below are **MCU-side**, so TX/RX cross:
+**Nothing else is needed. This is the milestone of 2026-10-23: a board was programmed
+end to end over one signal wire.**
+
+```sh
+python tools/load_audio_swio.py        # loader -> MCU, audio -> U3, player -> MCU
+```
+
+~40 s for the 82 KB chant, ending in a CRC32 the MCU computes over the whole image and
+the host checks. `src/loader/loader_swio.c` is flashed in place of the player, takes the
+audio through a RAM mailbox over the debug link, writes it to U3 over SPI, and the player
+goes back on at the end — all three steps in that one command. How the mailbox works and
+why: [`audio-pipeline.md`](audio-pipeline.md) route D.
+
+<details>
+<summary>Route C — the old UART loader, for a board that does wire PD5/PD6</summary>
+
+The dongle also exposes a USB-CDC serial port, which `send_chant.py` talks to. Labels
+below are **MCU-side**, so TX/RX cross:
 
 | WCH-LinkE | U1 | |
 |---|---|---|
@@ -160,63 +196,76 @@ the resync machinery could recover (`debug-log.md` §2). Do not confuse it with 
 **115200** the *player's* UART printf uses on the same PD5 wire: two firmwares, two
 rates, one pin.
 
-Leave the SWIO wire connected while you do this — the two interfaces do not conflict on
-this package, and a one-command load (`python tools/load_audio.py --pio`) needs both in
-one go: it flashes the loader over SWIO, streams the audio over CDC, then flashes the
-player back over SWIO.
-
 In PlatformIO the two interfaces are two different settings and mixing them up produces
 a confusing "port not found": **`upload_port` is the debug probe, `custom_chant_port` is
 the CDC port.** On Windows only the CDC side gets a `COMx` number.
 
+This route still works and is still tested in the tree. It is simply not what this board
+needs.
+
+</details>
+
 ### Which wires does each step need?
 
-Worth being explicit, because "it was only a few wires last time" is an easy memory to
-form: of the three steps in a chant load, **two are SWIO and only the middle one is
-serial.**
+All of them, the same three, for every step:
 
-| Step | Command | Interface | Wires it needs |
+| Step | Command | Interface | Wires |
 |---|---|---|---|
-| loader → MCU | `pio run -e loader -t upload` | SWIO | SWDIO→PD1, GND (+3V3) |
-| audio → U3 | `pio run -e loader -t sendchant` | USB-CDC serial | RX→PD5, TX→PD6, GND (+3V3) |
-| player → MCU | `pio run -e player -t upload` | SWIO | SWDIO→PD1, GND (+3V3) |
+| loader → MCU | (inside `load_audio_swio.py`) | SWIO | SWDIO→PD1, GND, 3V3 |
+| audio → U3 | (inside `load_audio_swio.py`) | SWIO | the same three |
+| player → MCU | (inside `load_audio_swio.py`) | SWIO | the same three |
 
-(Make equivalents, in the same order: `make -f Makefile.loader flash`,
-`python tools/send_chant.py`, `make flash`. The middle step is the same pyserial tool
-either way — `sendchant` just wraps it with the `custom_chant_*` settings.)
+That is the whole point of route D, and it is why the four remaining boards are one
+command each with nothing to re-plug.
 
-**Leave all five wires connected and none of this needs re-plugging** — which is the
-whole reason `python tools/load_audio.py --pio` can run the three steps back to back
-unattended.
+**You only need to load a chant once per board.** U3 is non-volatile and the player
+never writes it, so the chant survives every reflash of the MCU. Day-to-day firmware
+iteration — new player build, `pio run -e player -t upload`, press the switch — never
+touches it.
 
-**But you only need the serial pair when the chant itself changes.** U3 is non-volatile
-and the player never writes it, so once a chant is in there it survives every reflash of
-the MCU. Day-to-day firmware iteration — new player build, `pio run -e player -t upload`,
-press the switch — runs on the 3-wire J1 header alone, indefinitely. That is why a bench
-can go for sessions on three wires and still play the chant: the load happened once.
+### Which tool can actually drive the probe
 
-Each hookup on its own does exactly one thing, and neither is enough:
+**Measured on this project's Windows machine, 2026-10-23.** This matters more than it
+looks, because the docs used to hand out `minichlink` commands freely:
 
-- **A 3-wire J1 breakout (3V3, PD1, GND) flashes firmware and cannot load the chant.**
-  `send_chant.py` is a pyserial tool talking to a `COMx` port; PD1 is not a UART pin and
-  the loader firmware reads USART1. This is true of `pio run -e loader -t sendchant` too —
-  it wraps that same tool. If J1 is all you have broken out, PD5/PD6 have to be reachable
-  somewhere else — on the dev board's own pin header, say — before a chant load can work.
-- **A serial-only hookup (3V3, GND, RX, TX) loads the chant and cannot flash firmware.**
-  `pio ... -t upload` and `make flash` both go through `minichlink`, which speaks SWIO
-  only.
+| Tool | Opens this probe? | |
+|---|---|---|
+| OpenOCD (`tool-openocd-riscv-wch`) | **yes** | what `pio ... -t upload` uses, and `swio_link.py`'s default backend |
+| `wlink` (`tool-wlink`) | **yes** | WCH's own CLI; `wlink erase --method power-off` is the unbrick |
+| `minichlink` | **no** | `libusb_open() = -5` (`LIBUSB_ERROR_ACCESS`) |
 
-The chip itself is not the limitation here — the CH32V003 has a factory bootloader in
-system flash that does accept firmware over USART1 (PD5/PD6) via WCHISPTool or the
-`wchisp` CLI, so a TX/RX-only flash is possible in principle. **This project has never
-used it** and nothing in the tree is set up for it; if you ever do, note that there is no
-BOOT pin to force bootloader entry on this part.
+The LinkE enumerates as `VID_1A86&PID_8010` (`WCH-LinkRV`, RISC-V mode) bound to **WCH's
+own driver**. OpenOCD and `wlink` speak to that driver; `minichlink` wants a WinUSB
+binding and cannot open the device at all. **So no `minichlink` command in this tree can
+be assumed to run here** — not `minichlink -T` for printf, not `minichlink -u` to
+unbrick. Where this file used to say `minichlink -u`, it now says
+`wlink erase --method power-off`. Full write-up: [`debug-log.md`](debug-log.md) #6.
 
 ### Windows: the driver, and why PlatformIO is the easier route
 
-`minichlink` talks to the LinkE through libusb and needs the dongle's interface 1 bound
+`minichlink` talks to the LinkE through libusb and needs the dongle's interface bound
 to **WinUSB** — use [Zadig](https://zadig.akeo.ie/) if it reports that it cannot find the
 programmer. PlatformIO's upload path brings its own driver handling and sidesteps that.
+
+Measured on this machine, 2026-10-23, with the LinkE attached and healthy:
+
+```
+> minichlink -i
+Error: couldn't open wch link device (libusb_open() = -5)
+Error: Could not initialize any supported programmers
+```
+
+```
+> openocd -f wch-riscv.cfg -c "init"
+Info : WCH-LinkE  mode:RV version 2.20
+```
+
+The probe enumerates as `VID_1A86&PID_8010` (`WCH-LinkRV`, RISC-V mode) under WCH's own
+driver. OpenOCD and `wlink` speak to that driver; minichlink does not, and `-5` is
+`LIBUSB_ERROR_ACCESS` — the binding, not the cable. **So anything in this tree that
+needs a probe must be able to go through OpenOCD**, which is why
+`tools/swio_link.py` has an OpenOCD backend and defaults to it. Do not assume a
+`minichlink` command in any doc will run here.
 
 **This is not hypothetical: `make flash` has not worked on this project's Windows
 machine, and PlatformIO is what every successful flash here has used.** So the `pio`
@@ -376,7 +425,7 @@ output, so firmware does not depend on it. Fit it if you have the space.
 ## Tools
 
 - **WCH-LinkE** — acquired and in use. It is the programmer (SWIO on PD1) *and* the
-  USB-serial adapter for the audio loader (its CDC port on PD5/PD6). Those are two
+  USB-serial adapter the *old* UART loader used (its CDC port on PD5/PD6). Those are two
   different interfaces on one dongle; PlatformIO's `upload_port` means the first,
   `custom_chant_port` the second. Pin-by-pin wiring for both: [The WCH-LinkE — pins and
   how to hook it up](#the-wch-linke--pins-and-how-to-hook-it-up) above.
