@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../src"
+		},
+		{
+			"name": "chant-clicker",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}

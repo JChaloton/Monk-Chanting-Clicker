@@ -1,59 +1,209 @@
 /*
- * audio.c — PWM + double-buffered streaming. SKELETON, nothing implemented.
+ * audio.c — PWM output stage and double-buffered streaming from SPI flash.
  *
- * Bring-up order (docs/bring-up.md):
- *   stage 4: fixed 50 % duty, verify ~1.5 V after R1 and ~0.16 V at the divider
- *   stage 6: 440 Hz tone from a table, then the real chant from flash
+ * Two things here are worth understanding before changing anything.
+ *
+ * 1. The sample clock is TIM2, not TIM1 and not SysTick. The carrier is
+ *    187.5 kHz and 187500 / 8000 = 23.4375, so no whole-number division of the
+ *    TIM1 update event lands on 8 kHz. A second timer off the same 48 MHz APB
+ *    clock lands exactly: 48 000 000 / 8000 = 6000, so ATRLR = 5999.
+ *
+ *    It was SysTick first, for the same exact division, and that was a bug:
+ *    ch32fun builds Delay_Us()/Delay_Ms() on the free-running SysTick counter
+ *    (DelaySysTick() spins on SysTick->CNT). Reprogramming SysTick for the
+ *    sample rate breaks every delay in the firmware, and stopping it with
+ *    CTLR = 0 freezes CNT so the next Delay_*() never returns — the board hung
+ *    inside audio_stop()'s ramp with the amp still enabled, which sounds
+ *    exactly like "one press and then hiss forever". TIM2 is otherwise unused
+ *    and leaves ch32fun's timebase alone.
+ *
+ * 2. The ISR never touches SPI. It reads out of whichever buffer is active and
+ *    hands the spent one to the main loop. A 256-byte page is 32 ms of audio and
+ *    the SPI refill costs well under a millisecond, so there is enormous slack —
+ *    but only if the swap discipline is kept. If you ever find yourself wanting
+ *    to read flash from the ISR, that is the bug.
  */
 
-#include "ch32v003fun.h"
+#include "ch32fun.h"
 #include "board.h"
 #include "spiflash.h"
 #include "audio.h"
 
-static volatile uint8_t  buf[AUDIO_BUF_COUNT][AUDIO_BUF_BYTES];
-static volatile uint8_t  playing_idx;     /* buffer the ISR is reading      */
-static volatile uint16_t play_pos;        /* byte offset inside it          */
-static volatile uint8_t  refill_needed;   /* set by ISR, cleared by service */
-static volatile uint8_t  running;
+#define CFG_OUT_AFPP_10MHZ  0x9u
 
-static uint32_t src_addr;                 /* next flash address to read     */
+/* ---- state shared with the ISR ------------------------------------------- */
+
+static volatile uint8_t  buf[AUDIO_BUF_COUNT][AUDIO_BUF_BYTES];
+static volatile uint16_t fill[AUDIO_BUF_COUNT];  /* valid bytes; 0 = empty     */
+static volatile uint8_t  play_idx;               /* buffer the ISR is reading  */
+static volatile uint16_t play_pos;               /* byte offset inside it      */
+static volatile int8_t   refill_idx;             /* -1 = nothing to refill     */
+static volatile uint8_t  running;
+static volatile uint32_t played;                 /* samples out since start    */
+
+/* Main-loop only. */
+static uint32_t src_addr;
 static uint32_t src_remaining;
 
-/* ------------------------------------------------------------------------- */
+/* ---- output stage -------------------------------------------------------- */
+
+/*
+ * TIM1 is an advanced-control timer, so its outputs stay dead until MOE is set
+ * in BDTR. Forgetting that is the classic "PWM looks configured, pin does
+ * nothing" on this part.
+ */
+static void pwm_init(void)
+{
+    RCC->APB2PCENR |= RCC_APB2Periph_GPIOD | RCC_APB2Periph_TIM1
+                    | RCC_APB2Periph_AFIO;
+
+    PIN_AUDIO_PORT->CFGLR &= ~(0xfu << (4 * PIN_AUDIO_NUM));
+    PIN_AUDIO_PORT->CFGLR |=  (CFG_OUT_AFPP_10MHZ << (4 * PIN_AUDIO_NUM));
+
+    TIM1->PSC     = 0;                          /* no prescale: full 48 MHz   */
+    TIM1->ATRLR   = AUDIO_PWM_PERIOD - 1u;      /* 255 -> 8-bit, 187.5 kHz    */
+    TIM1->CHCTLR1 = TIM_OC1M_2 | TIM_OC1M_1 | TIM_OC1PE;   /* PWM mode 1      */
+    TIM1->CCER   |= TIM_CC1E;
+    TIM1->BDTR   |= TIM_MOE;                    /* advanced timer: arm output */
+    TIM1->CH1CVR  = AUDIO_IDLE_DUTY;            /* park at mid-scale, ~1.5 V  */
+    TIM1->SWEVGR |= TIM_UG;                     /* latch the preloaded values */
+    TIM1->CTLR1  |= TIM_ARPE | TIM_CEN;
+}
+
+/*
+ * Anti-pop. The PWM idle level is 50 % duty, not 0, because the amp input is
+ * capacitively coupled and only sees changes. Stepping from 128 straight to the
+ * first sample (or back again at the end) is a step change of up to half the
+ * rail, which the amp faithfully reproduces as a click. A few milliseconds of
+ * ramp makes it inaudible.
+ */
+static void ramp_to(uint16_t target)
+{
+    const int32_t steps = 64;
+    int32_t from = (int32_t)TIM1->CH1CVR;
+    int32_t delta = (int32_t)target - from;
+
+    for (int32_t i = 1; i <= steps; i++) {
+        TIM1->CH1CVR = (uint16_t)(from + (delta * i) / steps);
+        Delay_Us((AUDIO_RAMP_MS * 1000u) / (uint32_t)steps);
+    }
+    TIM1->CH1CVR = target;
+}
+
+/* ---- sample clock -------------------------------------------------------- */
+
+static void tick_start(uint32_t rate)
+{
+    RCC->APB1PCENR |= RCC_APB1Periph_TIM2;
+
+    TIM2->CTLR1    = 0;                     /* stopped while we reconfigure   */
+    TIM2->PSC      = 0;                     /* no prescale: full 48 MHz       */
+    TIM2->ATRLR    = (uint16_t)((FUNCONF_SYSTEM_CORE_CLOCK / rate) - 1u);
+    TIM2->CNT      = 0;
+    TIM2->SWEVGR   = TIM_UG;                /* latch PSC/ATRLR now            */
+    TIM2->INTFR    = 0;                     /* ...and drop the flag UG just set,
+                                             * or the ISR fires immediately   */
+    TIM2->DMAINTENR = TIM_UIE;
+    NVIC_EnableIRQ(TIM2_IRQn);
+    TIM2->CTLR1    = TIM_ARPE | TIM_CEN;
+}
+
+static void tick_stop(void)
+{
+    TIM2->CTLR1    = 0;
+    TIM2->DMAINTENR = 0;
+    TIM2->INTFR    = 0;
+    NVIC_DisableIRQ(TIM2_IRQn);
+}
+
+/*
+ * Sample ISR. Short on purpose: one bounds check, one store to the compare
+ * register, and the buffer swap. No SPI, no arithmetic, no printf.
+ */
+void TIM2_IRQHandler(void) __attribute__((interrupt));
+void TIM2_IRQHandler(void)
+{
+    TIM2->INTFR = 0;               /* clear first, or it immediately re-fires */
+
+    if (!running)
+        return;
+
+    uint8_t i = play_idx;
+
+    if (play_pos >= fill[i]) {
+        /* A short buffer means the main loop had nothing more to give: this was
+         * the tail of the chant. A full one means we simply reached its end. */
+        if (fill[i] < AUDIO_BUF_BYTES) {
+            running = 0;
+            return;
+        }
+        fill[i]    = 0;
+        refill_idx = (int8_t)i;    /* hand the spent buffer to the main loop */
+        play_idx   = i ^ 1u;
+        play_pos   = 0;
+        i          = play_idx;
+
+        /* Either the chant ended exactly on a page boundary, or the main loop
+         * did not refill in time. Stop rather than replay stale bytes — an
+         * underrun that loops old audio is far more confusing to debug than
+         * one that goes quiet. */
+        if (fill[i] == 0u) {
+            running = 0;
+            return;
+        }
+    }
+
+    TIM1->CH1CVR = buf[i][play_pos++];
+    played++;
+}
+
+/* ---- api ----------------------------------------------------------------- */
 
 void audio_init(void)
 {
-    /* TODO: TIM1 clock on, ARR = AUDIO_PWM_PERIOD - 1, no prescaler at 48 MHz
-     * -> 187.5 kHz carrier. CH1 PWM mode 1, preload enabled, output disabled
-     * for now. Compare register parked at AUDIO_IDLE_DUTY.
-     *
-     * Sample tick: 187500 / 8000 = 23.4375, so a whole-number TIM1 update
-     * divisor does not land on exactly 8 kHz. Either use a second timer for the
-     * tick, or accept a slightly shifted carrier. Decide and record the choice
-     * in docs/decisions.md. */
+    running    = 0;
+    refill_idx = -1;
+    fill[0] = fill[1] = 0;
+    pwm_init();
 }
 
-/* Sample-rate ISR — keep it short, and never touch SPI from here. */
-void audio_tick_isr(void)
+static uint32_t prime(uint8_t idx)
 {
-    /* TODO:
-     *   TIM1->CH1CVR = buf[playing_idx][play_pos++];
-     *   if (play_pos == AUDIO_BUF_BYTES) {
-     *       play_pos = 0;
-     *       refill_needed = playing_idx;      // hand the spent buffer to main
-     *       playing_idx ^= 1;
-     *   }
-     * For ADPCM, decode two samples per byte here instead. */
+    uint32_t n = src_remaining;
+
+    if (n > AUDIO_BUF_BYTES)
+        n = AUDIO_BUF_BYTES;
+    if (n) {
+        spiflash_read(src_addr, (uint8_t *)buf[idx], n);
+        src_addr      += n;
+        src_remaining -= n;
+    }
+    fill[idx] = (uint16_t)n;
+    return n;
 }
 
-void audio_start(uint32_t flash_addr, uint32_t len, uint8_t format)
+void audio_start(uint32_t flash_addr, uint32_t len, uint8_t format, uint32_t rate)
 {
-    /* TODO: (void)format for now — PCM8 only.
-     * Fill both buffers from flash, reset indices, ramp duty from
-     * AUDIO_IDLE_DUTY over AUDIO_RAMP_MS, enable the CH1 output and the tick. */
-    (void)flash_addr; (void)len; (void)format;
-    running = 0;
+    /* ADPCM would decode two samples per byte here. Not implemented — the
+     * player refuses rather than plays noise. See docs/decisions.md. */
+    if (format != FLASH_FMT_PCM8 || len == 0u || rate == 0u)
+        return;
+
+    running       = 0;
+    played        = 0;
+    play_idx      = 0;
+    play_pos      = 0;
+    refill_idx    = -1;
+    src_addr      = flash_addr;
+    src_remaining = len;
+
+    if (prime(0) == 0u)
+        return;
+    prime(1);
+
+    ramp_to(buf[0][0]);
+    running = 1;
+    tick_start(rate);
 }
 
 int audio_busy(void)
@@ -63,17 +213,46 @@ int audio_busy(void)
 
 void audio_service(void)
 {
-    /* TODO: if refill_needed is set, read the next AUDIO_BUF_BYTES from flash
-     * into that buffer, advance src_addr/src_remaining, clear the flag.
-     * A 256-byte page is 32 ms of audio and the SPI read takes well under a
-     * millisecond — enormous slack. It is the swap discipline, not bandwidth,
-     * that prevents stutter. Zero-pad the tail on the last partial buffer. */
+    int8_t i = refill_idx;
+
+    if (i < 0)
+        return;
+
+    /* Only one buffer is ever pending at a time — the ISR is always at least a
+     * whole buffer ahead of us — so there is no race worth locking against. */
+    prime((uint8_t)i);
+    refill_idx = -1;
 }
 
 void audio_stop(void)
 {
-    /* TODO: ramp the compare value back to AUDIO_IDLE_DUTY over AUDIO_RAMP_MS,
-     * then disable the CH1 output and the tick. Skipping the ramp gives an
-     * audible pop at the end of every chant. */
     running = 0;
+    tick_stop();
+    ramp_to(AUDIO_IDLE_DUTY);
+}
+
+/* ---- bring-up diagnostics ------------------------------------------------ */
+
+uint32_t audio_played(void)
+{
+    return played;
+}
+
+/*
+ * No flash, no interrupt, no buffers — just TIM1 and a delay loop. The swing is
+ * +/-64 counts either side of mid-scale rather than the full 0..255, because the
+ * point is to prove the chain works, not to test how loud it gets.
+ */
+void audio_test_tone(uint32_t hz, uint32_t ms)
+{
+    uint32_t half_us = 500000u / hz;
+    uint32_t cycles  = (ms * 1000u) / (half_us * 2u);
+
+    for (uint32_t i = 0; i < cycles; i++) {
+        TIM1->CH1CVR = AUDIO_IDLE_DUTY + 64u;
+        Delay_Us(half_us);
+        TIM1->CH1CVR = AUDIO_IDLE_DUTY - 64u;
+        Delay_Us(half_us);
+    }
+    TIM1->CH1CVR = AUDIO_IDLE_DUTY;
 }
